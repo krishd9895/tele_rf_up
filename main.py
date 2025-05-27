@@ -1,5 +1,5 @@
+
 import os
-import json
 import requests
 import telebot
 from datetime import timezone, timedelta
@@ -9,14 +9,36 @@ from requests.exceptions import RequestException, ProxyError, ConnectTimeout
 from datetime import datetime, timedelta
 from uuid import uuid4
 import re
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure, ServerSelectionTimeoutError
 
 # Telegram bot token (replace with your bot token)
 BOT_TOKEN = os.environ.get('BOT_TOKEN')
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# File paths for data storage
-SUBSCRIPTIONS_FILE = "subscriptions.json"
-PROXIES_FILE = "proxies.json"
+# MongoDB connection
+MONGO_URI = os.environ.get('MONGO_URI')
+if not MONGO_URI:
+    raise ValueError("MONGO_URI environment variable is required")
+
+# Initialize MongoDB client
+mongo_client = None
+db = None
+
+def init_mongodb():
+    global mongo_client, db
+    try:
+        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Test the connection
+        mongo_client.admin.command('ping')
+        db = mongo_client.weather_bot
+        write_log("INFO", "MongoDB connection established successfully")
+        return True
+    except (ConnectionFailure, ServerSelectionTimeoutError) as e:
+        write_log("ERROR", f"Failed to connect to MongoDB: {e}")
+        return False
+
+# File path for logs only (other data now in MongoDB)
 LOG_FILE = "logs.txt"
 
 # Owner's Telegram ID (replace with your Telegram ID)
@@ -45,54 +67,136 @@ def write_log(level, message):
             f"LOG ERROR: {e} | Original message: {level.upper()} - {message}")
 
 
-# Load or initialize subscriptions with error handling
+# Function to delete previous checking time log and append new one at the end
+def replace_last_checking_log(message):
+    try:
+        timestamp = datetime.now(INDIAN_TIMEZONE).strftime("%Y-%m-%d %H:%M:%S IST")
+        new_log_line = f"{timestamp} - INFO - {message}\n"
+        
+        # Read all existing logs
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding='utf-8') as f:
+                lines = f.readlines()
+            
+            # Remove the last "Checking Indian time" log if it exists
+            for i in range(len(lines) - 1, -1, -1):
+                if "Checking Indian time:" in lines[i]:
+                    lines.pop(i)  # Delete the line
+                    break
+            
+            # Append new checking time log at the end
+            lines.append(new_log_line)
+            
+            # Write back to file
+            with open(LOG_FILE, "w", encoding='utf-8') as f:
+                f.writelines(lines)
+        else:
+            # If log file doesn't exist, create it with the new log
+            with open(LOG_FILE, "w", encoding='utf-8') as f:
+                f.write(new_log_line)
+                
+    except Exception as e:
+        # Fallback to regular logging if replacement fails
+        write_log("INFO", message)
+        print(f"LOG REPLACE ERROR: {e}")
+
+
+# Load subscriptions from MongoDB
 def load_subscriptions():
     try:
-        if os.path.exists(SUBSCRIPTIONS_FILE):
-            with open(SUBSCRIPTIONS_FILE, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-                # Convert old format to new format if needed
-                if data and isinstance(list(data.values())[0], str):
-                    # Old format: {"chat_id": "suffix"}
-                    # New format: {"chat_id": ["suffix1", "suffix2", ...]}
-                    new_data = {}
-                    for chat_id, suffix in data.items():
-                        new_data[chat_id] = [suffix]
-                    save_subscriptions(new_data)
-                    return new_data
-                return data
-        return {}
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return {}
+        
+        subscriptions = {}
+        cursor = db.subscriptions.find()
+        for doc in cursor:
+            chat_id = doc['chat_id']
+            suffixes = doc.get('suffixes', [])
+            # Handle old format conversion
+            if isinstance(suffixes, str):
+                suffixes = [suffixes]
+            subscriptions[chat_id] = suffixes
+        
+        return subscriptions
     except Exception as e:
-        write_log("ERROR", f"Error loading subscriptions: {e}")
+        write_log("ERROR", f"Error loading subscriptions from MongoDB: {e}")
         return {}
 
 
 def save_subscriptions(subscriptions):
     try:
-        with open(SUBSCRIPTIONS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(subscriptions, f, indent=4)
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return
+        
+        # Clear existing subscriptions
+        db.subscriptions.delete_many({})
+        
+        # Insert new subscriptions
+        for chat_id, suffixes in subscriptions.items():
+            if suffixes:  # Only save if user has subscriptions
+                db.subscriptions.insert_one({
+                    'chat_id': chat_id,
+                    'suffixes': suffixes,
+                    'updated_at': datetime.now(INDIAN_TIMEZONE)
+                })
+        
+        write_log("INFO", "Subscriptions saved to MongoDB successfully")
     except Exception as e:
-        write_log("ERROR", f"Error saving subscriptions: {e}")
+        write_log("ERROR", f"Error saving subscriptions to MongoDB: {e}")
 
 
-# Load or initialize proxies with error handling
+# Load proxies from MongoDB
 def load_proxies():
     try:
-        if os.path.exists(PROXIES_FILE):
-            with open(PROXIES_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        return {"proxies": [], "failed": []}
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return {"proxies": [], "failed": []}
+        
+        # Get proxies document
+        proxies_doc = db.proxies.find_one({'_id': 'proxy_config'})
+        if proxies_doc:
+            return {
+                'proxies': proxies_doc.get('proxies', []),
+                'failed': proxies_doc.get('failed', [])
+            }
+        else:
+            # Create default document if it doesn't exist
+            default_config = {"proxies": [], "failed": []}
+            db.proxies.insert_one({
+                '_id': 'proxy_config',
+                'proxies': [],
+                'failed': [],
+                'updated_at': datetime.now(INDIAN_TIMEZONE)
+            })
+            return default_config
     except Exception as e:
-        write_log("ERROR", f"Error loading proxies: {e}")
+        write_log("ERROR", f"Error loading proxies from MongoDB: {e}")
         return {"proxies": [], "failed": []}
 
 
 def save_proxies(proxies_data):
     try:
-        with open(PROXIES_FILE, 'w', encoding='utf-8') as f:
-            json.dump(proxies_data, f, indent=4)
+        if db is None:
+            write_log("ERROR", "MongoDB not initialized")
+            return
+        
+        # Update or insert proxies configuration
+        db.proxies.replace_one(
+            {'_id': 'proxy_config'},
+            {
+                '_id': 'proxy_config',
+                'proxies': proxies_data.get('proxies', []),
+                'failed': proxies_data.get('failed', []),
+                'updated_at': datetime.now(INDIAN_TIMEZONE)
+            },
+            upsert=True
+        )
+        
+        write_log("INFO", "Proxies saved to MongoDB successfully")
     except Exception as e:
-        write_log("ERROR", f"Error saving proxies: {e}")
+        write_log("ERROR", f"Error saving proxies to MongoDB: {e}")
 
 
 # Convert 24-hour time to 12-hour AM/PM format with date
@@ -373,13 +477,13 @@ def check_proxies_and_fetch(url,
         error_msg = "❌ Proxies configuration is invalid or empty."
         write_log(
             "ERROR",
-            "Proxies JSON is empty, has wrong indentation, or invalid structure"
+            "Proxies configuration is empty or invalid structure"
         )
 
         if str(chat_id) != OWNER_ID:
             bot.send_message(
                 OWNER_ID,
-                "🚨 Proxies configuration is invalid or empty. Check proxies.json file."
+                "🚨 Proxies configuration is invalid or empty. Check MongoDB proxy configuration."
             )
 
         # Try direct request as fallback
@@ -432,7 +536,7 @@ def check_proxies_and_fetch(url,
         if str(chat_id) != OWNER_ID:
             bot.send_message(
                 OWNER_ID,
-                "🚨 No proxies available. Please add proxies to proxies.json file."
+                "🚨 No proxies available. Please add proxies using /update_proxy command."
             )
 
         # Try direct request as fallback
@@ -555,8 +659,8 @@ def check_indian_time_and_update():
         indian_time = datetime.now(INDIAN_TIMEZONE)
         current_minute = indian_time.minute
 
-        write_log(
-            "INFO",
+        # Replace the last checking time log instead of appending
+        replace_last_checking_log(
             f"Checking Indian time: {indian_time.strftime('%Y-%m-%d %H:%M:%S IST')}, minute: {current_minute}"
         )
 
@@ -1171,6 +1275,12 @@ def start_bot():
 # Start the bot
 if __name__ == "__main__":
     try:
+        # Initialize MongoDB connection
+        if not init_mongodb():
+            write_log("CRITICAL", "Failed to initialize MongoDB. Exiting...")
+            print("Failed to connect to MongoDB. Please check your MONGO_URI environment variable.")
+            exit(1)
+        
         # Start Indian time checker in a background thread
         threading.Thread(target=run_indian_time_checker, daemon=True).start()
         write_log("INFO", "Bot started successfully")
@@ -1182,3 +1292,8 @@ if __name__ == "__main__":
         write_log("CRITICAL", f"Fatal error: {e}")
         print(f"Fatal error: {e}")
         print("Bot will restart automatically...")
+    finally:
+        # Close MongoDB connection
+        if mongo_client:
+            mongo_client.close()
+            write_log("INFO", "MongoDB connection closed")

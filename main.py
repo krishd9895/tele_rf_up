@@ -531,8 +531,8 @@ def run_scheduler():
 threading.Thread(target=run_scheduler, daemon=True).start()
 
 
-# Command: /start with error handling
-@bot.message_handler(commands=['start'])
+# Command: /help with error handling
+@bot.message_handler(commands=['help'])
 def send_welcome(message):
     try:
         welcome_msg = f"""
